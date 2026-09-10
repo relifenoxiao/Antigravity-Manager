@@ -2135,6 +2135,8 @@ pub async fn handle_chat_completions(
                 last_error = e.clone();
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 drop(image_permit.take());
+                force_rotate = true;
+                token_manager.clear_session_binding(&session_id);
                 debug!(
                     "OpenAI Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -2212,7 +2214,7 @@ pub async fn handle_chat_completions(
                 let mut openai_stream = create_openai_sse_stream(
                     gemini_stream,
                     openai_req.model.clone(),
-                    session_id,
+                    session_id.clone(),
                     message_count,
                     Some(client_tool_names.clone()),
                 );
@@ -2277,6 +2279,8 @@ pub async fn handle_chat_completions(
 
                 if retry_this_account {
                     failure_statuses.record(StatusCode::BAD_GATEWAY);
+                    force_rotate = true;
+                    token_manager.clear_session_binding(&session_id);
                     continue; // Rotate to next account
                 }
                 // Combine first chunk with remaining stream
@@ -2554,13 +2558,37 @@ pub async fn handle_chat_completions(
             .await;
         }
 
+        // [FIX] 429/529 时立即解绑当前会话并清除上次使用记录，确保换号重试与后续请求不会死锁在受限账号上
+        if status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id);
+            token_manager
+                .clear_last_used_account(Some(&account_id))
+                .await;
+            tracing::debug!(
+                "[OpenAI] Unbound session {} from account {} due to status {}",
+                session_id,
+                email,
+                status_code
+            );
+        }
+
+        let scheduling_mode = token_manager.get_scheduling_mode().await;
+        let allow_grace = match scheduling_mode {
+            crate::proxy::sticky_config::SchedulingMode::Balance => {
+                token_manager.tokens_count() <= 1
+            }
+            crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+            crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+        };
+
         // 确定重试策略
-        let strategy = retry_state.determine_strategy(
+        let strategy = retry_state.determine_strategy_with_grace(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             false,
+            allow_grace,
         );
         let should_mark_limited =
             status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
@@ -3820,7 +3848,7 @@ pub async fn handle_completions(
                             headers,
                             format!("Token error: {}", e),
                         )
-                            .into_response()
+                            .into_response();
                     }
                 }
             };
@@ -3936,6 +3964,8 @@ pub async fn handle_completions(
             Err(e) => {
                 last_error = e.clone();
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
+                force_rotate = true;
+                token_manager.clear_session_binding(&session_id_str);
                 debug!(
                     "Codex Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -4062,6 +4092,8 @@ pub async fn handle_completions(
 
                     if retry_this_account {
                         failure_statuses.record(StatusCode::BAD_GATEWAY);
+                        force_rotate = true;
+                        token_manager.clear_session_binding(&session_id_str);
                         continue;
                     }
 
@@ -4492,12 +4524,35 @@ pub async fn handle_completions(
                 .await;
         }
 
-        let strategy = retry_state.determine_strategy(
+        if status_code == 429 || status_code == 529 {
+            token_manager.clear_session_binding(&session_id);
+            token_manager
+                .clear_last_used_account(Some(&account_id))
+                .await;
+            tracing::debug!(
+                "[OpenAI] Unbound session {} from account {} due to status {}",
+                session_id,
+                email,
+                status_code
+            );
+        }
+
+        let scheduling_mode = token_manager.get_scheduling_mode().await;
+        let allow_grace = match scheduling_mode {
+            crate::proxy::sticky_config::SchedulingMode::Balance => {
+                token_manager.tokens_count() <= 1
+            }
+            crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+            crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+        };
+
+        let strategy = retry_state.determine_strategy_with_grace(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             false,
+            allow_grace,
         );
 
         // 执行退备
@@ -4946,13 +5001,20 @@ pub async fn handle_images_generations_internal(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
+                            let scheduling_mode = token_manager.get_scheduling_mode().await;
+                            let allow_grace = match scheduling_mode {
+                                crate::proxy::sticky_config::SchedulingMode::Balance => token_manager.tokens_count() <= 1,
+                                crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+                                crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+                            };
                             let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
+                                retry_state.determine_strategy_with_grace(
                                     &account_id,
                                     status_code,
                                     &err_text,
                                     retry_after.as_deref(),
                                     false,
+                                    allow_grace,
                                 )
                             });
                             // 429/500/503: mark limited before retry/rotation
@@ -5431,13 +5493,24 @@ pub async fn handle_images_edits(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
+                            let scheduling_mode = token_manager.get_scheduling_mode().await;
+                            let allow_grace = match scheduling_mode {
+                                crate::proxy::sticky_config::SchedulingMode::Balance => {
+                                    token_manager.tokens_count() <= 1
+                                }
+                                crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+                                crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => {
+                                    false
+                                }
+                            };
                             let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
+                                retry_state.determine_strategy_with_grace(
                                     &account_id,
                                     status_code,
                                     &err_text,
                                     retry_after.as_deref(),
                                     false,
+                                    allow_grace,
                                 )
                             });
                             // 429/500/503 等错误进行标记和重试

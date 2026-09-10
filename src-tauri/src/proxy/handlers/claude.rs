@@ -238,7 +238,7 @@ The structure MUST be as follows:
 // ===== 统一退避策略模块 =====
 // 移除本地重复定义，使用 common 中的统一实现
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    apply_retry_strategy, determine_retry_strategy_with_grace, should_rotate_account, RetryStrategy,
 };
 
 // ===== 退避策略模块结束 =====
@@ -1212,6 +1212,10 @@ pub async fn handle_messages(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                force_rotate = true;
+                if let Some(sid) = session_id {
+                    token_manager.clear_session_binding(sid);
+                }
                 debug!(
                     "Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -1377,6 +1381,10 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    force_rotate = true;
+                    if let Some(sid) = session_id {
+                        token_manager.clear_session_binding(sid);
+                    }
                     continue;
                 }
 
@@ -1636,11 +1644,21 @@ pub async fn handle_messages(
                 )
                 .await;
 
-            // [FIX] 遭遇 429 限流或服务端过载时，立即解绑会话，防止下一轮尝试或后续请求死锁在故障账号上
+            // [FIX] 遭遇 429 限流或服务端过载时，立即解绑会话并清除上次使用记录，防止下一轮尝试或后续请求死锁在故障账号上
             if status_code == 429 || status_code == 529 {
                 if let Some(sid) = session_id {
                     token_manager.clear_session_binding(sid);
-                    debug!("[{}] Unbound session {} from account {} due to status {}", trace_id, sid, email, status_code);
+                    token_manager
+                        .clear_last_used_account(Some(&account_id))
+                        .await;
+                    debug!(
+                        "[{}] Unbound session {} from account {} due to status {}",
+                        trace_id, sid, email, status_code
+                    );
+                } else {
+                    token_manager
+                        .clear_last_used_account(Some(&account_id))
+                        .await;
                 }
             }
         }
@@ -1802,9 +1820,22 @@ pub async fn handle_messages(
             }
         }
 
+        let scheduling_mode = token_manager.get_scheduling_mode().await;
+        let allow_grace = match scheduling_mode {
+            crate::proxy::sticky_config::SchedulingMode::Balance => {
+                token_manager.tokens_count() <= 1
+            }
+            crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+            crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+        };
+
         // 确定重试策略
-        let retry_strategy =
-            determine_retry_strategy(status_code, &error_text, retried_without_thinking);
+        let retry_strategy = determine_retry_strategy_with_grace(
+            status_code,
+            &error_text,
+            retried_without_thinking,
+            allow_grace,
+        );
 
         // 执行退避
         if apply_retry_strategy(
@@ -1895,7 +1926,8 @@ pub async fn handle_messages(
             last_status
         };
 
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
+        {
             if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
                 headers.insert(axum::http::header::RETRY_AFTER, val);
             }
@@ -1917,7 +1949,8 @@ pub async fn handle_messages(
                 headers.insert("X-Mapped-Model", v);
             }
         }
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
+        {
             if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
                 headers.insert(axum::http::header::RETRY_AFTER, val);
             }

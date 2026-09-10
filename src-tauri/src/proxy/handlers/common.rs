@@ -13,7 +13,7 @@ use tracing::{debug, info};
 // ===== 统一重试与退避策略 =====
 
 /// 重试策略枚举
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetryStrategy {
     /// 不重试，直接返回错误
     NoRetry,
@@ -33,6 +33,7 @@ pub struct RequestRetryState {
 }
 
 impl RequestRetryState {
+    #[allow(dead_code)]
     pub fn determine_strategy(
         &mut self,
         account_id: &str,
@@ -41,7 +42,26 @@ impl RequestRetryState {
         retry_after: Option<&str>,
         retried_without_thinking: bool,
     ) -> RetryStrategy {
-        let allow_grace_retry = !self.grace_retried_accounts.contains(account_id);
+        self.determine_strategy_with_grace(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            true,
+        )
+    }
+
+    pub fn determine_strategy_with_grace(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        allow_grace: bool,
+    ) -> RetryStrategy {
+        let allow_grace_retry = allow_grace && !self.grace_retried_accounts.contains(account_id);
         let strategy = determine_retry_strategy_inner(
             status_code,
             error_text,
@@ -99,10 +119,20 @@ impl FailureStatusTracker {
 }
 
 /// 根据错误状态码和错误信息确定重试策略
+#[allow(dead_code)]
 pub fn determine_retry_strategy(
     status_code: u16,
     error_text: &str,
     retried_without_thinking: bool,
+) -> RetryStrategy {
+    determine_retry_strategy_with_grace(status_code, error_text, retried_without_thinking, true)
+}
+
+pub fn determine_retry_strategy_with_grace(
+    status_code: u16,
+    error_text: &str,
+    retried_without_thinking: bool,
+    allow_grace: bool,
 ) -> RetryStrategy {
     if status_code == 429 {
         let lower = error_text.to_lowercase();
@@ -111,8 +141,8 @@ pub fn determine_retry_strategy(
             || lower.contains("exceeded your current quota")
             || lower.contains("insufficient_quota");
 
-        // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
-        if is_hard_quota_exhausted {
+        // [FIX] 硬配额耗尽或不允许 grace retry 时必须立即轮换账号，绝不走 Grace Retry
+        if is_hard_quota_exhausted || !allow_grace {
             return RetryStrategy::FixedDelay(Duration::from_millis(50));
         }
 
@@ -137,7 +167,7 @@ pub fn determine_retry_strategy(
         error_text,
         None,
         retried_without_thinking,
-        true,
+        allow_grace,
     )
 }
 
@@ -172,8 +202,8 @@ fn determine_retry_strategy_inner(
                 || lower.contains("exceeded your current quota")
                 || lower.contains("insufficient_quota");
 
-            // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
-            if is_hard_quota_exhausted {
+            // [FIX] 硬配额耗尽或不允许 grace retry (平衡/性能模式且多账号) 必须立即轮换账号，绝不走 Grace Retry 或长退避
+            if is_hard_quota_exhausted || !allow_grace_retry {
                 return RetryStrategy::FixedDelay(Duration::from_millis(50));
             }
 
@@ -246,16 +276,13 @@ mod tests {
             let mut retry_same_account = false;
             let mut sends = Vec::new();
 
-            while let Some(attempt) = next_rotation_attempt(
-                &mut used_attempts,
-                account_count,
-                retry_same_account,
-            ) {
+            while let Some(attempt) =
+                next_rotation_attempt(&mut used_attempts, account_count, retry_same_account)
+            {
                 retry_same_account = false;
                 sends.push(attempt);
                 let account_id = format!("account-{}", attempt);
-                let strategy =
-                    state.determine_strategy(&account_id, 429, body, None, false);
+                let strategy = state.determine_strategy(&account_id, 429, body, None, false);
                 if matches!(strategy, RetryStrategy::GraceRetry(_)) {
                     assert!(!should_rotate_account(429, Some(&strategy)));
                     retry_same_account = true;
@@ -479,10 +506,7 @@ mod retry_after_tests {
             extract_retry_after_seconds("Token error: All accounts limited. Wait 5s."),
             Some(5)
         );
-        assert_eq!(
-            extract_retry_after_seconds("Token pool is empty"),
-            None
-        );
+        assert_eq!(extract_retry_after_seconds("Token pool is empty"), None);
         assert_eq!(
             extract_retry_after_seconds("All accounts failed or unhealthy."),
             None
@@ -504,10 +528,7 @@ mod retry_after_tests {
             headers.get("x-account-email").unwrap().to_str().unwrap(),
             "test@example.com"
         );
-        assert_eq!(
-            headers.get("retry-after").unwrap().to_str().unwrap(),
-            "45"
-        );
+        assert_eq!(headers.get("retry-after").unwrap().to_str().unwrap(), "45");
 
         let headers_no_wait = build_token_error_headers(
             Some("gemini-2.5-pro"),
@@ -516,9 +537,12 @@ mod retry_after_tests {
         );
         assert!(headers_no_wait.get("retry-after").is_none());
         assert_eq!(
-            headers_no_wait.get("x-mapped-model").unwrap().to_str().unwrap(),
+            headers_no_wait
+                .get("x-mapped-model")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "gemini-2.5-pro"
         );
     }
 }
-

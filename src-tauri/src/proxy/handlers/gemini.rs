@@ -321,6 +321,8 @@ pub async fn handle_generate(
                 last_error = e.clone();
                 failure_statuses.record(StatusCode::BAD_GATEWAY);
                 drop(image_permit.take());
+                force_rotate = true;
+                token_manager.clear_session_binding(&session_id);
                 debug!(
                     "Gemini Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -442,6 +444,8 @@ pub async fn handle_generate(
 
                 if retry_gemini {
                     failure_statuses.record(StatusCode::BAD_GATEWAY);
+                    force_rotate = true;
+                    token_manager.clear_session_binding(&session_id);
                     continue;
                 }
                 let s_id_for_stream = s_id.clone();
@@ -760,21 +764,41 @@ pub async fn handle_generate(
             }
         }
 
-        // [FIX] 429 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
+        // [FIX] 429 时立即解绑当前会话并清除上次使用记录，确保换号重试与后续请求不会死锁在受限账号上
         if status_code == 429 || status_code == 529 {
             token_manager.clear_session_binding(&session_id);
-            tracing::debug!("[Gemini] Unbound session {} from account {} due to status {}", session_id, email, status_code);
+            token_manager
+                .clear_last_used_account(Some(&account_id))
+                .await;
+            tracing::debug!(
+                "[Gemini] Unbound session {} from account {} due to status {}",
+                session_id,
+                email,
+                status_code
+            );
         }
 
+        let scheduling_mode = token_manager.get_scheduling_mode().await;
+        let allow_grace = match scheduling_mode {
+            crate::proxy::sticky_config::SchedulingMode::Balance => {
+                token_manager.tokens_count() <= 1
+            }
+            crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+            crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+        };
+
         // 确定重试策略
-        let strategy = retry_state.determine_strategy(
+        let strategy = retry_state.determine_strategy_with_grace(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             false,
+            allow_grace,
         );
-        let needs_quota_refresh = if config.request_type == "image_gen" && status_code == 429 {
+        let should_mark_limited =
+            status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
+        let needs_quota_refresh = if config.request_type == "image_gen" && should_mark_limited {
             token_manager
                 .mark_rate_limited_fast(
                     &email,
@@ -793,6 +817,19 @@ pub async fn handle_generate(
         if needs_quota_refresh {
             token_manager
                 .refresh_quota_lock_after_fast_mark(&email, Some(&mapped_model))
+                .await;
+        }
+
+        // 3. 标记限流状态
+        if config.request_type != "image_gen" && should_mark_limited {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                )
                 .await;
         }
         let trace_id = format!("gemini_{}", session_id);
@@ -960,11 +997,7 @@ pub async fn handle_count_tokens(
 ///
 /// 获取有效 OAuth Token，将标准 Gemini 请求体包装为 v1internal 格式后转发，
 /// 返回真实的 token 计数，而不是硬编码的 0
-pub async fn execute_count_tokens(
-    state: AppState,
-    model_name: String,
-    body: Value,
-) -> Response {
+pub async fn execute_count_tokens(state: AppState, model_name: String, body: Value) -> Response {
     // 1. 模型路由解析
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
@@ -996,11 +1029,7 @@ pub async fn execute_count_tokens(
     {
         Ok(t) => t,
         Err(e) => {
-            let headers = build_token_error_headers(
-                Some(mapped_model.as_str()),
-                None,
-                &e,
-            );
+            let headers = build_token_error_headers(Some(mapped_model.as_str()), None, &e);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,

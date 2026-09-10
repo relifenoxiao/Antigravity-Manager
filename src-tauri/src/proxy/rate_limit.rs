@@ -361,7 +361,15 @@ impl RateLimitTracker {
 
         // 1. 解析限流原因类型
         let reason = if status == 429 {
-            tracing::warn!("Google 429 Error Body: {}", body);
+            if body.len() > 500 {
+                let mut end = 500;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                tracing::warn!("Google 429 Error Body: {}... [truncated]", &body[..end]);
+            } else {
+                tracing::warn!("Google 429 Error Body: {}", body);
+            }
             self.parse_rate_limit_reason(body)
         } else if status == 404 {
             tracing::warn!(
@@ -499,7 +507,12 @@ impl RateLimitTracker {
         };
 
         let mut retry_sec = retry_sec;
-        let max_allowed_lockout = backoff_steps.iter().copied().max().unwrap_or(MAX_LOCKOUT_SECONDS).max(MAX_LOCKOUT_SECONDS);
+        let max_allowed_lockout = backoff_steps
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(MAX_LOCKOUT_SECONDS)
+            .max(MAX_LOCKOUT_SECONDS);
         if retry_sec > max_allowed_lockout && !preserve_long_image_quota {
             tracing::info!(
                 "Capping retry lockout time for {} from {}s to {}s (max backoff limit)",
@@ -557,6 +570,20 @@ impl RateLimitTracker {
                     .and_then(|o| o.get("reason"))
                     .and_then(|v| v.as_str())
                 {
+                    let r_upper = reason_str.to_uppercase();
+                    if r_upper.contains("QUOTA")
+                        || r_upper.contains("CREDIT")
+                        || r_upper.contains("EXHAUSTED")
+                        || r_upper.contains("BALANCE")
+                    {
+                        return RateLimitReason::QuotaExhausted;
+                    }
+                    if r_upper.contains("RATE_LIMIT") || r_upper.contains("CONCURRENCY") {
+                        return RateLimitReason::RateLimitExceeded;
+                    }
+                    if r_upper.contains("MODEL_CAPACITY") || r_upper.contains("CAPACITY") {
+                        return RateLimitReason::ModelCapacityExhausted;
+                    }
                     return match reason_str {
                         "QUOTA_EXHAUSTED" => RateLimitReason::QuotaExhausted,
                         "RATE_LIMIT_EXCEEDED" => RateLimitReason::RateLimitExceeded,
@@ -1057,12 +1084,24 @@ mod tests {
         let target_time = SystemTime::now() + Duration::from_secs(5 * 3600); // 5 hours
 
         // Capped: should be capped to 300s
-        tracker.set_lockout_until_with_cap("acc_cap", target_time, RateLimitReason::QuotaExhausted, None, true);
+        tracker.set_lockout_until_with_cap(
+            "acc_cap",
+            target_time,
+            RateLimitReason::QuotaExhausted,
+            None,
+            true,
+        );
         let wait_capped = tracker.get_remaining_wait("acc_cap", None);
         assert!(wait_capped <= 300 && wait_capped >= 290);
 
         // Uncapped (Zero Quota): should retain full 5 hours duration
-        tracker.set_lockout_until_with_cap("acc_uncap", target_time, RateLimitReason::QuotaExhausted, None, false);
+        tracker.set_lockout_until_with_cap(
+            "acc_uncap",
+            target_time,
+            RateLimitReason::QuotaExhausted,
+            None,
+            false,
+        );
         let wait_uncapped = tracker.get_remaining_wait("acc_uncap", None);
         assert!(wait_uncapped > 300 && wait_uncapped <= 5 * 3600);
     }
