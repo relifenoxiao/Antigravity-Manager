@@ -442,7 +442,7 @@ pub async fn monitor_middleware(
                                 .map(|s| s.to_string())
                         });
                     }
-                    Some(s.to_string())
+                    crate::modules::proxy_db::truncate_body_for_storage(Some(s))
                 } else {
                     Some("[Binary Request Data]".to_string())
                 };
@@ -535,10 +535,15 @@ pub async fn monitor_middleware(
         tokio::spawn(async move {
             let mut all_stream_data = Vec::new();
             let mut last_few_bytes = Vec::new();
+            const MAX_STREAM_CAPTURE_BYTES: usize = 256 * 1024;
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
-                    all_stream_data.extend_from_slice(&chunk);
+                    if all_stream_data.len() < MAX_STREAM_CAPTURE_BYTES {
+                        let remaining = MAX_STREAM_CAPTURE_BYTES - all_stream_data.len();
+                        let take = remaining.min(chunk.len());
+                        all_stream_data.extend_from_slice(&chunk[..take]);
+                    }
 
                     if chunk.len() > 8192 {
                         last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
@@ -762,6 +767,49 @@ pub async fn monitor_middleware(
                             _ => {}
                         }
 
+                        // Gemini format: candidates[0].content.parts / response.candidates[0].content.parts
+                        let candidates = json
+                            .get("candidates")
+                            .or_else(|| json.get("response").and_then(|r| r.get("candidates")));
+                        if let Some(candidates) = candidates.and_then(|c| c.as_array()) {
+                            for cand in candidates {
+                                if let Some(parts) = cand
+                                    .get("content")
+                                    .and_then(|c| c.get("parts"))
+                                    .and_then(|p| p.as_array())
+                                {
+                                    for part in parts {
+                                        let text =
+                                            part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                        let is_thought = part
+                                            .get("thought")
+                                            .and_then(|t| t.as_bool())
+                                            .unwrap_or(false);
+                                        if is_thought {
+                                            thinking_content.push_str(text);
+                                        } else if !text.is_empty() {
+                                            response_content.push_str(text);
+                                        }
+                                        if let Some(call) = part.get("functionCall") {
+                                            let name = call
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("");
+                                            let args = call
+                                                .get("args")
+                                                .map(|a| a.to_string())
+                                                .unwrap_or_default();
+                                            tool_calls.push(serde_json::json!({
+                                                "id": format!("call_{}", tool_calls.len()),
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": args }
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Legacy Claude delta (for older implementations or simplified streams)
                         if msg_type.is_none() {
                             if let Some(delta) = json.get("delta") {
@@ -896,13 +944,14 @@ pub async fn monitor_middleware(
                 }
 
                 if consolidated.is_empty() {
-                    // Fallback: store raw SSE data if parsing failed
-                    log.response_body = Some(full_response.to_string());
+                    // Fallback: store raw SSE data if parsing failed (truncated to avoid log explosion)
+                    log.response_body =
+                        crate::modules::proxy_db::truncate_body_for_storage(Some(full_response));
                 } else {
-                    log.response_body = Some(
-                        serde_json::to_string_pretty(&Value::Object(consolidated))
-                            .unwrap_or_else(|_| full_response.to_string()),
-                    );
+                    let formatted = serde_json::to_string_pretty(&Value::Object(consolidated))
+                        .unwrap_or_else(|_| full_response.to_string());
+                    log.response_body =
+                        crate::modules::proxy_db::truncate_body_for_storage(Some(&formatted));
                 }
             } else {
                 log.response_body = Some(format!(
@@ -945,7 +994,10 @@ pub async fn monitor_middleware(
             // [FIX #3325] Fallback input token estimation for stream responses
             if log.input_tokens.is_none() {
                 if let Some(ref req_body) = log.request_body {
-                    let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
+                    let estimated =
+                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
+                            req_body,
+                        );
                     if estimated > 0 {
                         log.input_tokens = Some(estimated);
                     }
@@ -993,9 +1045,12 @@ pub async fn monitor_middleware(
                         log.response_body = serde_json::from_str::<Value>(&s)
                             .ok()
                             .and_then(|json| summarize_image_json_response(&json))
-                            .or_else(|| Some(s.to_string()));
+                            .or_else(|| {
+                                crate::modules::proxy_db::truncate_body_for_storage(Some(&s))
+                            });
                     } else {
-                        log.response_body = Some(s.to_string());
+                        log.response_body =
+                            crate::modules::proxy_db::truncate_body_for_storage(Some(&s));
                     }
                 } else {
                     log.response_body = Some("[Binary Response Data]".to_string());

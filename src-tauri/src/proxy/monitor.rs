@@ -48,19 +48,50 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+        // Auto cleanup old logs (keep last 7 days and max 10,000 records, periodic maintenance)
+        tokio::spawn(async move {
+            // Initial delayed startup run (5s after start to avoid contending with boot IO)
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            loop {
+                tokio::task::spawn_blocking(|| {
+                    match crate::modules::proxy_db::maintain_proxy_logs(7, 2_000) {
+                        Ok((deleted_time, deleted_count)) => {
+                            if deleted_time > 0 || deleted_count > 0 {
+                                tracing::info!(
+                                    "Log maintenance: removed {} expired and {} excess logs",
+                                    deleted_time,
+                                    deleted_count
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to maintain proxy logs: {}", e);
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup old logs: {}", e);
-                }
-            },
-        );
+
+                    if let Err(e) = crate::modules::security_db::cleanup_old_ip_logs(7) {
+                        tracing::error!("Failed to cleanup old IP logs: {}", e);
+                    }
+
+                    if let Err(e) = crate::modules::logger::cleanup_old_logs(7) {
+                        tracing::warn!("Failed to cleanup file logs: {}", e);
+                    }
+
+                    if let Err(e) = crate::proxy::debug_logger::cleanup_debug_logs_blocking(
+                        3,
+                        100 * 1024 * 1024,
+                    ) {
+                        tracing::warn!("Failed to cleanup debug logs: {}", e);
+                    }
+                })
+                .await
+                .ok();
+
+                // Run every 1 hour
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
@@ -110,13 +141,20 @@ impl ProxyMonitor {
             }
         }
 
-        // Add log to memory
+        // Add log to memory (truncate bodies to prevent memory expansion)
         {
             let mut logs = self.logs.write().await;
             if logs.len() >= self.max_logs {
                 logs.pop_back();
             }
-            logs.push_front(log.clone());
+            let mut mem_log = log.clone();
+            mem_log.request_body = crate::modules::proxy_db::truncate_body_for_storage(
+                mem_log.request_body.as_deref(),
+            );
+            mem_log.response_body = crate::modules::proxy_db::truncate_body_for_storage(
+                mem_log.response_body.as_deref(),
+            );
+            logs.push_front(mem_log);
         }
 
         // Save to DB

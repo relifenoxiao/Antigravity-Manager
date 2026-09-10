@@ -371,8 +371,10 @@ pub fn cleanup_old_ip_logs(days: i64) -> Result<usize, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // VACUUM to reclaim space
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
+    if deleted > 0 {
+        let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+        let _ = conn.execute("PRAGMA incremental_vacuum(500)", []);
+    }
 
     Ok(deleted)
 }

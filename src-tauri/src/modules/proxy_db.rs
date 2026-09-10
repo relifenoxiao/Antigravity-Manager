@@ -23,6 +23,9 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
 
+    // Enable incremental vacuum mode for gradual space reclamation
+    let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
+
     Ok(conn)
 }
 
@@ -82,8 +85,103 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum stored body size in database (64 KB) to prevent log database explosion
+pub const MAX_STORED_BODY_BYTES: usize = 64 * 1024;
+
+/// Sanitize large inline media (base64 data) from request/response body before storage
+pub fn sanitize_body_inline_media(body: &str) -> String {
+    if (body.starts_with('{') || body.starts_with('['))
+        && (body.contains("data:image/")
+            || body.contains("data:audio/")
+            || body.contains("\"inlineData\"")
+            || body.contains("\"inline_data\""))
+    {
+        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(body) {
+            strip_json_inline_media(&mut val);
+            if let Ok(serialized) = serde_json::to_string(&val) {
+                return serialized;
+            }
+        }
+    }
+
+    if body.contains("data:image/") || body.contains("data:audio/") {
+        if let Ok(re) = regex::Regex::new(
+            r#"data:(image|audio|video)/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]{100,}"#,
+        ) {
+            return re.replace_all(body, "[inline media omitted]").into_owned();
+        }
+    }
+
+    body.to_string()
+}
+
+fn strip_json_inline_media(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if (k == "data" || k == "inlineData" || k == "inline_data") && v.is_string() {
+                    let len = v.as_str().map(|s| s.len()).unwrap_or(0);
+                    if len > 200 {
+                        *v = serde_json::Value::String(format!(
+                            "[inline data omitted: {} chars]",
+                            len
+                        ));
+                    }
+                } else if k == "url" && v.is_string() {
+                    if let Some(s) = v.as_str() {
+                        if s.starts_with("data:image/") || s.starts_with("data:audio/") {
+                            *v = serde_json::Value::String(format!(
+                                "[data url omitted: {} chars]",
+                                s.len()
+                            ));
+                        }
+                    }
+                } else {
+                    strip_json_inline_media(v);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                strip_json_inline_media(item);
+            }
+        }
+        serde_json::Value::String(s) => {
+            if (s.starts_with("data:image/") || s.starts_with("data:audio/")) && s.len() > 200 {
+                *s = format!("[data url omitted: {} chars]", s.len());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Truncate large request or response body safely before persisting to SQLite
+pub fn truncate_body_for_storage(body: Option<&str>) -> Option<String> {
+    let body = body?;
+    let sanitized = sanitize_body_inline_media(body);
+    if sanitized.len() <= MAX_STORED_BODY_BYTES {
+        Some(sanitized)
+    } else {
+        // Safe UTF-8 character boundary truncation
+        let mut end = MAX_STORED_BODY_BYTES;
+        while end > 0 && !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &sanitized[..end];
+        Some(format!(
+            "{}\n... [truncated: showing first {} bytes of {} bytes]",
+            truncated,
+            end,
+            sanitized.len()
+        ))
+    }
+}
+
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
+
+    let req_body = truncate_body_for_storage(log.request_body.as_deref());
+    let resp_body = truncate_body_for_storage(log.response_body.as_deref());
 
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username)
@@ -97,8 +195,8 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.duration,
             log.model,
             log.error,
-            log.request_body,
-            log.response_body,
+            req_body,
+            resp_body,
             log.input_tokens,
             log.output_tokens,
             log.cached_tokens,
@@ -242,18 +340,16 @@ pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Only execute VACUUM when substantial rows were deleted to avoid saturating disk I/O on startup
-    if deleted >= 500 {
-        if let Err(e) = conn.execute("VACUUM", []) {
-            tracing::warn!("VACUUM failed after log cleanup: {}", e);
-        }
+    if deleted > 0 {
+        // Reclaim WAL space passively and run incremental vacuum without full blocking rewrite
+        let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+        let _ = conn.execute("PRAGMA incremental_vacuum(500)", []);
     }
 
     Ok(deleted)
 }
 
 /// Limit maximum log count (keep newest N records)
-#[allow(dead_code)]
 pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
     let conn = connect_db()?;
 
@@ -266,14 +362,90 @@ pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Only execute VACUUM when substantial rows were deleted
-    if deleted >= 500 {
-        if let Err(e) = conn.execute("VACUUM", []) {
-            tracing::warn!("VACUUM failed after limit_max_logs: {}", e);
-        }
+    if deleted > 0 {
+        let _ = conn.execute("PRAGMA wal_checkpoint(PASSIVE)", []);
+        let _ = conn.execute("PRAGMA incremental_vacuum(500)", []);
     }
 
     Ok(deleted)
+}
+
+/// Maximum database size in bytes (100 MB). When exceeded, prune oldest records.
+pub const MAX_DB_SIZE_BYTES: u64 = 100 * 1024 * 1024;
+pub const TARGET_DB_SIZE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Cleanup log database if its file size on disk exceeds limit
+pub fn cleanup_database_size(max_bytes: u64, _target_bytes: u64) -> Result<usize, String> {
+    let db_path = get_proxy_db_path()?;
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let file_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    let wal_path = db_path.with_extension("db-wal");
+    let wal_size = if wal_path.exists() {
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let total_size = file_size + wal_size;
+    if total_size <= max_bytes {
+        return Ok(0);
+    }
+
+    tracing::warn!(
+        "Proxy log database size ({} MB) exceeds limit ({} MB), pruning oldest records...",
+        total_size / 1024 / 1024,
+        max_bytes / 1024 / 1024
+    );
+
+    let conn = connect_db()?;
+    let total_rows: u64 = conn
+        .query_row("SELECT COUNT(*) FROM request_logs", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    if total_rows == 0 {
+        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+        let _ = conn.execute("VACUUM", []);
+        return Ok(0);
+    }
+
+    // Keep the most recent 50% of rows (at least 100)
+    let rows_to_keep = (total_rows / 2).max(100);
+    let deleted = conn
+        .execute(
+            "DELETE FROM request_logs WHERE id NOT IN (
+                SELECT id FROM request_logs ORDER BY timestamp DESC LIMIT ?1
+            )",
+            [rows_to_keep],
+        )
+        .map_err(|e| e.to_string())?;
+
+    if deleted > 0 {
+        let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+        if let Err(e) = conn.execute("VACUUM", []) {
+            tracing::warn!("VACUUM after database size cleanup failed: {}", e);
+        }
+        tracing::info!(
+            "Pruned {} old log records and compacted proxy DB to stay under size limit",
+            deleted
+        );
+    }
+
+    Ok(deleted)
+}
+
+/// Comprehensive log maintenance: clean up expired logs by age, cap max rows, and checkpoint WAL
+pub fn maintain_proxy_logs(
+    days_to_keep: i64,
+    max_records: usize,
+) -> Result<(usize, usize), String> {
+    let deleted_old = cleanup_old_logs(days_to_keep)?;
+    let deleted_excess = limit_max_logs(max_records)?;
+    let _ = cleanup_database_size(MAX_DB_SIZE_BYTES, TARGET_DB_SIZE_BYTES);
+    Ok((deleted_old, deleted_excess))
 }
 
 pub fn clear_logs() -> Result<(), String> {

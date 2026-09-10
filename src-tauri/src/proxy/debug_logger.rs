@@ -279,6 +279,78 @@ where
     Box::pin(wrapped)
 }
 
+/// Cleanup debug exchange files older than `days_to_keep` OR if total size exceeds `max_bytes`
+pub fn cleanup_debug_logs_blocking(days_to_keep: u64, max_bytes: u64) -> Result<(), String> {
+    let data_dir = match crate::modules::account::get_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => return Err(e),
+    };
+    let debug_dir = data_dir.join("debug_logs");
+    if !debug_dir.exists() {
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let cutoff_time = now.saturating_sub(days_to_keep * 24 * 3600);
+
+    let subdirs = vec![debug_dir.clone(), debug_dir.join("debug_exchanges")];
+    for dir in subdirs {
+        if !dir.exists() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let mut files_info = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(metadata) = path.metadata() {
+                let modified = metadata.modified().unwrap_or(std::time::SystemTime::now());
+                let modified_secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                files_info.push((path, metadata.len(), modified_secs));
+            }
+        }
+
+        // 1. Delete expired files
+        let mut remaining = Vec::new();
+        for (path, size, modified) in files_info {
+            if modified < cutoff_time {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                remaining.push((path, size, modified));
+            }
+        }
+
+        // 2. Enforce size cap
+        let mut total_size: u64 = remaining.iter().map(|(_, s, _)| *s).sum();
+        if total_size > max_bytes {
+            remaining.sort_by_key(|(_, _, modified)| *modified);
+            let target_size = max_bytes / 2;
+            for (path, size, _) in remaining {
+                if total_size <= target_size {
+                    break;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    total_size = total_size.saturating_sub(size);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,8 +95,8 @@ pub fn cleanup_old_logs(days_to_keep: u64) -> Result<(), String> {
     }
 
     // Constants for size-based cleanup
-    const MAX_TOTAL_SIZE_BYTES: u64 = 1024 * 1024 * 1024; // 1GB
-    const TARGET_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
+    const MAX_TOTAL_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
+    const TARGET_SIZE_BYTES: u64 = 50 * 1024 * 1024; // 50MB
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -166,16 +166,30 @@ pub fn cleanup_old_logs(days_to_keep: u64) -> Result<(), String> {
                 break;
             }
 
-            // Try to delete. Skip if it's the most recent file and it fails (might be active)
+            // Try to delete. If it fails (might be active / open file on Windows), truncate it!
             if let Err(e) = fs::remove_file(&path) {
                 warn!(
                     "Failed to delete log file during size cleanup {:?}: {}",
                     path, e
                 );
+                if let Ok(file) = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                {
+                    drop(file);
+                    deleted_count += 1;
+                    total_size_freed += size;
+                    current_total_size = current_total_size.saturating_sub(size);
+                    info!(
+                        "Truncated active log file (size limit): {:?}",
+                        path.file_name()
+                    );
+                }
             } else {
                 deleted_count += 1;
                 total_size_freed += size;
-                current_total_size -= size;
+                current_total_size = current_total_size.saturating_sub(size);
                 info!("Deleted log file (size limit): {:?}", path.file_name());
             }
         }
