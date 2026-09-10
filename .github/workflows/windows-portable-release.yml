@@ -1,0 +1,119 @@
+name: Build & Publish Windows Portable Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*-portable*"
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Disable updater signing requirements
+        shell: pwsh
+        run: |
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content -Raw $configPath | ConvertFrom-Json
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
+          Write-Host "Disabled updater artifacts for unsigned build."
+
+      - name: Build Tauri App (Release)
+        run: npm run tauri build
+
+      - name: Package Portable Distribution
+        shell: pwsh
+        run: |
+          $exePath = "src-tauri/target/release/antigravity-tools.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Could not find built executable at $exePath"
+            exit 1
+          }
+
+          $portableDir = "Antigravity-Tools-Portable"
+          New-Item -ItemType Directory -Path $portableDir -Force
+          Copy-Item $exePath -Destination "$portableDir/antigravity-tools.exe"
+
+          # Create portable launcher for isolated data mode
+          $launcherContent = "@echo off`r`nset `"ABV_DATA_DIR=%~dp0data`"`r`nstart `"`" `"%~dp0antigravity-tools.exe`""
+          Set-Content -Path "$portableDir/run-portable.bat" -Value $launcherContent -Encoding ASCII
+
+          # Compress to zip
+          $zipName = "Antigravity-Tools-v4.7.0-windows-x64-portable.zip"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath $zipName -Force
+          Write-Host "Created portable archive: $zipName"
+
+      - name: Create or Update GitHub Release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag -or $tag -eq "fix/autonomous-issues") {
+            $tag = "v4.7.0-portable"
+          }
+
+          $files = @(
+            "Antigravity-Tools-v4.7.0-windows-x64-portable.zip"
+          )
+
+          # Also collect NSIS setup if present
+          $nsisFiles = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          foreach ($file in $nsisFiles) {
+            $files += $file.FullName
+          }
+
+          Write-Host "Publishing release $tag with files: $($files -join ', ')"
+
+          # Check if release already exists
+          $releaseExists = $false
+          try {
+            gh release view $tag --repo ${{ github.repository }} 2>$null
+            if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+          } catch {
+            $releaseExists = $false
+          }
+
+          $notes = @"
+          ## Antigravity Tools v4.7.0 Windows x64 便携版
+
+          ### 📦 包含核心修复：
+          1. **解决日志无限膨胀与磁盘饱和 (Issue #3386)**：
+             - 限制单条请求体与响应体落盘大小（最大 256KB），清洗 Base64 媒体数据；
+             - 废除启动时全库排他锁 `VACUUM`，改用非阻塞增量回收 `PRAGMA incremental_vacuum` 与 `wal_checkpoint`。
+          2. **解决平衡模式 429 不换号死锁 (Issue #3213)**：
+             - 平衡模式下禁用 429 Grace Retry 原地等待，立即触发账号自动轮换；
+             - 遇到 429/529 立即解绑当前会话及上次使用记录，排除重试账号防重复抽中。
+
+          ### 💡 便携版使用指南：
+          - 直接运行 `antigravity-tools.exe`：共享系统原有配置目录（`%USERPROFILE%\.antigravity_tools`）。
+          - 运行 `run-portable.bat`：采用同级 `data/` 目录完全独立隔离便携运行。
+          "@
+
+          if ($releaseExists) {
+            gh release upload $tag @files --repo ${{ github.repository }} --clobber
+          } else {
+            gh release create $tag @files `
+              --repo ${{ github.repository }} `
+              --title "Antigravity Tools v4.7.0 (Windows x64 便携版)" `
+              --notes $notes `
+              --target ${{ github.ref_name }}
+          }
