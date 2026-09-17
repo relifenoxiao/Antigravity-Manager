@@ -42,7 +42,9 @@ impl RequestRetryState {
         retried_without_thinking: bool,
     ) -> RetryStrategy {
         let is_balance = crate::modules::config::load_app_config()
-            .map(|cfg| cfg.proxy.scheduling.mode == crate::proxy::sticky_config::SchedulingMode::Balance)
+            .map(|cfg| {
+                cfg.proxy.scheduling.mode == crate::proxy::sticky_config::SchedulingMode::Balance
+            })
             .unwrap_or(true);
         let allow_grace_retry = !is_balance && !self.grace_retried_accounts.contains(account_id);
         let strategy = determine_retry_strategy_inner(
