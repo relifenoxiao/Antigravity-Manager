@@ -836,7 +836,7 @@ pub async fn handle_generate(
         }
 
         if status_code == 429 || status_code == 529 {
-            token_manager.unbind_session_and_clear_last_used(Some(&session_id));
+            token_manager.unbind_session_and_clear_last_used(Some(&session_id)).await;
             tracing::debug!(
                 "[Gemini] Unbound session {} from account {} due to status {}",
                 session_id,

@@ -3538,13 +3538,12 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
-    pub fn unbind_session_and_clear_last_used(&self, session_id: Option<&str>) {
+    pub async fn unbind_session_and_clear_last_used(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             self.session_accounts.remove(sid);
         }
-        if let Ok(mut last_used) = self.last_used_account.try_lock() {
-            *last_used = None;
-        }
+        let mut last_used = self.last_used_account.lock().await;
+        *last_used = None;
     }
 
     /// 清除所有会话的粘性映射
