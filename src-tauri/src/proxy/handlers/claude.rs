@@ -1707,10 +1707,11 @@ pub async fn handle_messages(
                 )
                 .await;
 
-            // [FIX] 遭遇 429 限流或服务端过载时，立即解绑会话，防止下一轮尝试或后续请求死锁在故障账号上
             if status_code == 429 || status_code == 529 {
+                token_manager
+                    .unbind_session_and_clear_last_used(session_id)
+                    .await;
                 if let Some(sid) = session_id {
-                    token_manager.clear_session_binding(sid);
                     debug!(
                         "[{}] Unbound session {} from account {} due to status {}",
                         trace_id, sid, email, status_code

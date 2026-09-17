@@ -41,7 +41,12 @@ impl RequestRetryState {
         retry_after: Option<&str>,
         retried_without_thinking: bool,
     ) -> RetryStrategy {
-        let allow_grace_retry = !self.grace_retried_accounts.contains(account_id);
+        let is_balance = crate::modules::config::load_app_config()
+            .map(|cfg| {
+                cfg.proxy.scheduling.mode == crate::proxy::sticky_config::SchedulingMode::Balance
+            })
+            .unwrap_or(true);
+        let allow_grace_retry = !is_balance && !self.grace_retried_accounts.contains(account_id);
         let strategy = determine_retry_strategy_inner(
             status_code,
             error_text,
@@ -109,7 +114,8 @@ pub fn determine_retry_strategy(
         let is_hard_quota_exhausted = lower.contains("resource_exhausted")
             || lower.contains("quota_exhausted")
             || lower.contains("exceeded your current quota")
-            || lower.contains("insufficient_quota");
+            || lower.contains("insufficient_quota")
+            || lower.contains("credits");
 
         // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
         if is_hard_quota_exhausted {
@@ -170,7 +176,8 @@ fn determine_retry_strategy_inner(
             let is_hard_quota_exhausted = lower.contains("resource_exhausted")
                 || lower.contains("quota_exhausted")
                 || lower.contains("exceeded your current quota")
-                || lower.contains("insufficient_quota");
+                || lower.contains("insufficient_quota")
+                || lower.contains("credits");
 
             // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
             if is_hard_quota_exhausted {
