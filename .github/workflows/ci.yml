@@ -66,12 +66,6 @@ jobs:
         with:
           workspaces: "src-tauri"
 
-      - name: Ensure frontend dist directory exists
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          if (-not (Test-Path "dist/index.html")) { Set-Content -Path "dist/index.html" -Value "<html/>" }
-
       - name: Check Rust formatting
         run: |
           cd src-tauri

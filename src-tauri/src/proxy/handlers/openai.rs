@@ -2713,6 +2713,10 @@ pub async fn handle_chat_completions(
                 .await;
         }
 
+        if status_code == 429 || status_code == 529 {
+            token_manager.unbind_session_and_clear_last_used(Some(&session_id));
+        }
+
         // [FIX] 403 时优先检测 VALIDATION_REQUIRED 并设置 is_forbidden / validation_block 状态，确保及时提取 URL 与更新 UI
         if status_code == 403 {
             if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
@@ -4737,7 +4741,7 @@ pub async fn handle_completions(
         );
 
         // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+        if status_code == 429 || status_code == 529 {
             token_manager
                 .mark_rate_limited_async(
                     &email,
@@ -4747,6 +4751,7 @@ pub async fn handle_completions(
                     Some(&mapped_model),
                 )
                 .await;
+            token_manager.unbind_session_and_clear_last_used(Some(&session_id_str));
         }
 
         let strategy = retry_state.determine_strategy(
@@ -5239,6 +5244,9 @@ pub async fn handle_images_generations_internal(
                             if !matches!(strategy.as_ref(), Some(RetryStrategy::GraceRetry(_))) {
                                 drop(image_permit.take());
                             }
+                            if status_code == 429 || status_code == 529 {
+                                token_manager.unbind_session_and_clear_last_used(None);
+                            }
                             if needs_quota_refresh {
                                 token_manager
                                     .refresh_quota_lock_after_fast_mark(
@@ -5723,6 +5731,9 @@ pub async fn handle_images_edits(
                             };
                             if !matches!(strategy.as_ref(), Some(RetryStrategy::GraceRetry(_))) {
                                 drop(image_permit.take());
+                            }
+                            if status_code == 429 || status_code == 529 {
+                                token_manager.unbind_session_and_clear_last_used(None);
                             }
                             if needs_quota_refresh {
                                 token_manager

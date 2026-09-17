@@ -594,6 +594,7 @@ impl RateLimitTracker {
             || body_lower.contains("quota limit")
             || body_lower.contains("per day")
             || body_lower.contains("daily quota")
+            || body_lower.contains("credits")
             || (body_lower.contains("quota_exhausted")
                 && crate::proxy::upstream::retry::parse_retry_delay(body, None).is_some());
 
