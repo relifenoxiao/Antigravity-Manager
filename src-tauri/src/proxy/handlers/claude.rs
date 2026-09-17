@@ -1708,7 +1708,9 @@ pub async fn handle_messages(
                 .await;
 
             if status_code == 429 || status_code == 529 {
-                token_manager.unbind_session_and_clear_last_used(session_id).await;
+                token_manager
+                    .unbind_session_and_clear_last_used(session_id)
+                    .await;
                 if let Some(sid) = session_id {
                     debug!(
                         "[{}] Unbound session {} from account {} due to status {}",

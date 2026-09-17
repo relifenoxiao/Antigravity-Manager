@@ -2714,7 +2714,9 @@ pub async fn handle_chat_completions(
         }
 
         if status_code == 429 || status_code == 529 {
-            token_manager.unbind_session_and_clear_last_used(Some(&session_id)).await;
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id))
+                .await;
         }
 
         // [FIX] 403 时优先检测 VALIDATION_REQUIRED 并设置 is_forbidden / validation_block 状态，确保及时提取 URL 与更新 UI
@@ -4754,7 +4756,9 @@ pub async fn handle_completions(
         }
 
         if status_code == 429 || status_code == 529 {
-            token_manager.unbind_session_and_clear_last_used(Some(&session_id_str)).await;
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id_str))
+                .await;
         }
 
         let strategy = retry_state.determine_strategy(
