@@ -3191,7 +3191,10 @@ mod tests {
 
         let mut claude = HeaderMap::new();
         claude.insert("x-session-id", "generic-session".parse().unwrap());
-        claude.insert("x-claude-code-session-id", "claude-code-session".parse().unwrap());
+        claude.insert(
+            "x-claude-code-session-id",
+            "claude-code-session".parse().unwrap(),
+        );
         assert_eq!(
             explicit_session_id_with_query(&claude, None, None).as_deref(),
             Some("claude-code-session")
